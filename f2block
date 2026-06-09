@@ -1,0 +1,219 @@
+#!/bin/bash
+
+# ==========================================
+# Fail2Ban Block Manager
+# Author: ChatGPT
+# ==========================================
+
+DB_DIR="$HOME/.f2block"
+DB="$DB_DIR/fail2ban_block.db"
+
+mkdir -p "$DB_DIR"
+
+show_help() {
+cat << EOF
+
+Fail2Ban Block Manager
+
+Usage:
+  $(basename "$0")                同步 fail2ban 封禁列表到 iptables 和数据库
+
+Options:
+  -l [N]          查看最近记录（默认50条）
+  -s              查看统计信息
+  -ip <IP>        查询指定IP
+  -c <CC>         查询指定国家代码（如 RO、NL、CN）
+  -h              显示帮助信息
+
+Examples:
+  $(basename "$0")
+  $(basename "$0") -l
+  $(basename "$0") -l 20
+  $(basename "$0") -s
+  $(basename "$0") -ip 45.148.10.141
+  $(basename "$0") -c RO
+
+Database:
+  $DB
+
+EOF
+}
+
+# 初始化数据库
+sqlite3 "$DB" "
+CREATE TABLE IF NOT EXISTS blocked_ips (
+    ip TEXT PRIMARY KEY,
+    country TEXT,
+    region TEXT,
+    city TEXT,
+    org TEXT,
+    first_seen TEXT,
+    last_seen TEXT
+);
+"
+
+# =========================
+# 参数处理
+# =========================
+
+case "$1" in
+
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+
+    -l)
+        LIMIT=${2:-50}
+
+        sqlite3 -header -column "$DB" "
+        SELECT
+            last_seen AS LastSeen,
+            ip AS IP,
+            country AS Country,
+            region AS Region,
+            city AS City,
+            org AS Organization
+        FROM blocked_ips
+        ORDER BY last_seen DESC
+        LIMIT $LIMIT;
+        "
+        exit 0
+        ;;
+
+    -s)
+        echo
+        echo "=== Total Blocked IPs ==="
+        sqlite3 "$DB" "
+        SELECT COUNT(*)
+        FROM blocked_ips;
+        "
+
+        echo
+        echo "=== Top 10 Countries ==="
+
+        sqlite3 -header -column "$DB" "
+        SELECT
+            country,
+            COUNT(*) AS count
+        FROM blocked_ips
+        GROUP BY country
+        ORDER BY count DESC
+        LIMIT 10;
+        "
+
+        exit 0
+        ;;
+
+    -ip)
+
+        if [ -z "$2" ]; then
+            echo "Usage: $0 -ip <IP>"
+            exit 1
+        fi
+
+        sqlite3 -header -column "$DB" "
+        SELECT *
+        FROM blocked_ips
+        WHERE ip='$2';
+        "
+
+        exit 0
+        ;;
+
+    -c)
+
+        if [ -z "$2" ]; then
+            echo "Usage: $0 -c <CountryCode>"
+            exit 1
+        fi
+
+        sqlite3 -header -column "$DB" "
+        SELECT *
+        FROM blocked_ips
+        WHERE country=UPPER('$2')
+        ORDER BY last_seen DESC;
+        "
+
+        exit 0
+        ;;
+
+esac
+
+# =========================
+# 同步 fail2ban
+# =========================
+
+IPS=$(fail2ban-client status sshd 2>/dev/null | \
+      sed -n '/Banned IP list:/s/.*Banned IP list:[[:space:]]*//p')
+
+if [ -z "$IPS" ]; then
+    echo "No banned IPs found in fail2ban."
+    exit 0
+fi
+
+for IP in $IPS; do
+
+    # iptables不存在则添加
+    if ! iptables -C INPUT -s "$IP" -j DROP 2>/dev/null; then
+        iptables -I INPUT -s "$IP" -j DROP
+    fi
+
+    # 数据库已存在则只更新最后发现时间
+    EXISTS=$(sqlite3 "$DB" "
+    SELECT 1
+    FROM blocked_ips
+    WHERE ip='$IP'
+    LIMIT 1;
+    ")
+
+    if [ "$EXISTS" = "1" ]; then
+
+        sqlite3 "$DB" "
+        UPDATE blocked_ips
+        SET last_seen=datetime('now','localtime')
+        WHERE ip='$IP';
+        "
+
+        continue
+    fi
+
+    # 查询IP信息
+    INFO=$(curl -s --max-time 10 "https://ipinfo.io/$IP/json")
+
+    COUNTRY=$(echo "$INFO" | grep '"country"' | awk -F'"' '{print $4}')
+    REGION=$(echo "$INFO" | grep '"region"' | awk -F'"' '{print $4}')
+    CITY=$(echo "$INFO" | grep '"city"' | awk -F'"' '{print $4}')
+    ORG=$(echo "$INFO" | grep '"org"' | awk -F'"' '{print $4}')
+
+    [[ -z "$COUNTRY" ]] && COUNTRY="Unknown"
+    [[ -z "$REGION" ]] && REGION="Unknown"
+    [[ -z "$CITY" ]] && CITY="Unknown"
+    [[ -z "$ORG" ]] && ORG="Unknown"
+
+    sqlite3 "$DB" "
+    INSERT OR IGNORE INTO blocked_ips
+    (
+        ip,
+        country,
+        region,
+        city,
+        org,
+        first_seen,
+        last_seen
+    )
+    VALUES
+    (
+        '$IP',
+        '$COUNTRY',
+        '$REGION',
+        '$CITY',
+        '$ORG',
+        datetime('now','localtime'),
+        datetime('now','localtime')
+    );
+    "
+
+    echo "Blocked $IP ($COUNTRY, $REGION, $CITY, $ORG)"
+
+done
