@@ -1,0 +1,13 @@
+[Unit]
+Description=Fail2Ban Threat Tracker
+After=network-online.target fail2ban.service
+
+[Service]
+Type=simple
+Environment="HOME=/root"
+ExecStart=/root/.f2block/f2blockd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

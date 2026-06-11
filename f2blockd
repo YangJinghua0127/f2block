@@ -1,0 +1,230 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DB_DIR="$SCRIPT_DIR"
+DB="$DB_DIR/f2block.db"
+LOGFILE="/var/log/fail2ban.log"
+ALLOWLIST="$DB_DIR/allowlist.txt"
+API_DELAY=1  # ipinfo.io 请求间隔(秒)，避免触发限流
+
+mkdir -p "$DB_DIR"
+
+# 初始化数据库
+sqlite3 "$DB" "
+CREATE TABLE IF NOT EXISTS blocked_ips (
+    ip TEXT PRIMARY KEY,
+    country TEXT,
+    region TEXT,
+    city TEXT,
+    org TEXT,
+    first_seen TEXT,
+    last_ban_time TEXT,
+    ban_count INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS ban_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT NOT NULL,
+    jail TEXT,
+    ban_time TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS processed_log (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_inode INTEGER,
+    last_offset INTEGER
+);
+"
+
+# SQL 转义单引号，防止注入
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# 检查 IP 是否在白名单中
+is_allowed() {
+    [ -f "$ALLOWLIST" ] && grep -qxF "$1" "$ALLOWLIST" 2>/dev/null
+}
+
+# 使用 jq 解析 JSON，不可用时回退到 grep+awk
+get_ip_info() {
+    local IP="$1"
+
+    # 先查数据库，已有记录则跳过 API 调用
+    local existing
+    existing=$(sqlite3 "$DB" "SELECT country, region, city, org FROM blocked_ips WHERE ip='$(sql_escape "$IP")';")
+    if [ -n "$existing" ]; then
+        IFS='|' read -r COUNTRY REGION CITY ORG <<< "$existing"
+        return
+    fi
+
+    local INFO
+    INFO=$(curl -s --max-time 10 "https://ipinfo.io/$IP/json")
+
+    if command -v jq &>/dev/null; then
+        COUNTRY=$(echo "$INFO" | jq -r '.country // "Unknown"')
+        REGION=$(echo "$INFO" | jq -r '.region // "Unknown"')
+        CITY=$(echo "$INFO" | jq -r '.city // "Unknown"')
+        ORG=$(echo "$INFO" | jq -r '.org // "Unknown"')
+    else
+        COUNTRY=$(echo "$INFO" | grep '"country"' | awk -F'"' '{print $4}')
+        REGION=$(echo "$INFO" | grep '"region"' | awk -F'"' '{print $4}')
+        CITY=$(echo "$INFO" | grep '"city"' | awk -F'"' '{print $4}')
+        ORG=$(echo "$INFO" | grep '"org"' | awk -F'"' '{print $4}')
+        [[ -z "$COUNTRY" ]] && COUNTRY="Unknown"
+        [[ -z "$REGION" ]] && REGION="Unknown"
+        [[ -z "$CITY" ]] && CITY="Unknown"
+        [[ -z "$ORG" ]] && ORG="Unknown"
+    fi
+
+    # 速率限制
+    sleep "$API_DELAY"
+}
+
+# 处理单条 Ban 日志行
+process_ban_line() {
+    local line="$1"
+
+    echo "$line" | grep -q " Ban " || return
+
+    local BAN_TIME JAIL IP
+    BAN_TIME=$(echo "$line" | awk '{print $1" "$2}')
+    JAIL=$(echo "$line" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+    IP=$(echo "$line" | sed -n 's/.* Ban \([0-9.]*\).*/\1/p')
+
+    [ -z "$IP" ] && return
+
+    # 白名单检查
+    if is_allowed "$IP"; then
+        echo "[ALLOW] $IP 在白名单中，跳过封禁"
+        return
+    fi
+
+    # 转义变量防止 SQL 注入
+    local E_IP E_JAIL E_BAN_TIME
+    E_IP=$(sql_escape "$IP")
+    E_JAIL=$(sql_escape "$JAIL")
+    E_BAN_TIME=$(sql_escape "$BAN_TIME")
+
+    get_ip_info "$IP"
+
+    local E_COUNTRY E_REGION E_CITY E_ORG
+    E_COUNTRY=$(sql_escape "$COUNTRY")
+    E_REGION=$(sql_escape "$REGION")
+    E_CITY=$(sql_escape "$CITY")
+    E_ORG=$(sql_escape "$ORG")
+
+    # 合并为一次事务，减少 sqlite3 进程调用
+    local EXISTS
+    EXISTS=$(sqlite3 "$DB" "SELECT 1 FROM blocked_ips WHERE ip='$E_IP' LIMIT 1;")
+
+    if [ "$EXISTS" = "1" ]; then
+        sqlite3 "$DB" "
+        BEGIN TRANSACTION;
+        INSERT INTO ban_events (ip, jail, ban_time) VALUES ('$E_IP', '$E_JAIL', '$E_BAN_TIME');
+        UPDATE blocked_ips SET last_ban_time='$E_BAN_TIME', ban_count=ban_count+1 WHERE ip='$E_IP';
+        COMMIT;
+        "
+        echo "[UPDATE] $IP"
+    else
+        sqlite3 "$DB" "
+        BEGIN TRANSACTION;
+        INSERT INTO ban_events (ip, jail, ban_time) VALUES ('$E_IP', '$E_JAIL', '$E_BAN_TIME');
+        INSERT INTO blocked_ips (ip, country, region, city, org, first_seen, last_ban_time, ban_count)
+        VALUES ('$E_IP', '$E_COUNTRY', '$E_REGION', '$E_CITY', '$E_ORG', '$E_BAN_TIME', '$E_BAN_TIME', 1);
+        COMMIT;
+        "
+        echo "[NEW] $IP"
+    fi
+
+    # iptables 全端口封禁
+    if ! iptables -C INPUT -s "$IP" -j DROP 2>/dev/null; then
+        iptables -I INPUT -s "$IP" -j DROP
+        echo "[IPTables] 封禁 $IP"
+    fi
+}
+
+# 启动时回扫：处理日志中已有的 Ban 事件
+replay_log() {
+    [ ! -f "$LOGFILE" ] && { echo "[f2blockd] 日志文件不存在: $LOGFILE"; return; }
+
+    # 读取上次处理进度
+    local last_inode=0 last_offset=0
+    local progress
+    progress=$(sqlite3 "$DB" "SELECT last_inode, last_offset FROM processed_log WHERE id=1;" 2>/dev/null)
+    if [ -n "$progress" ]; then
+        IFS='|' read -r last_inode last_offset <<< "$progress"
+    fi
+
+    local current_inode
+    current_inode=$(stat -c '%i' "$LOGFILE" 2>/dev/null || echo "0")
+
+    local replay_count=0
+
+    if [ "$current_inode" != "$last_inode" ] || [ "$last_offset" -eq 0 ] 2>/dev/null; then
+        # inode 变化（日志轮转）或首次运行，从头回扫
+        echo "[f2blockd] 回扫日志（完整扫描）..."
+        while IFS= read -r line; do
+            process_ban_line "$line"
+            ((replay_count++))
+        done < "$LOGFILE"
+    else
+        # inode 未变，从上次偏移量继续
+        echo "[f2blockd] 回扫日志（从偏移 $last_offset 继续）..."
+        while IFS= read -r line; do
+            process_ban_line "$line"
+            ((replay_count++))
+        done < <(tail -c +"$((last_offset + 1))" "$LOGFILE")
+    fi
+
+    echo "[f2blockd] 回扫完成，处理了 $replay_count 行"
+
+    # 记录当前进度
+    local new_offset
+    new_offset=$(stat -c '%s' "$LOGFILE" 2>/dev/null || echo "0")
+    sqlite3 "$DB" "
+    INSERT OR REPLACE INTO processed_log (id, last_inode, last_offset) VALUES (1, $current_inode, $new_offset);
+    "
+}
+
+# 信号处理：优雅退出
+cleanup() {
+    echo "[f2blockd] 收到退出信号，正在停止..."
+    # 保存当前日志进度
+    if [ -f "$LOGFILE" ]; then
+        local current_inode new_offset
+        current_inode=$(stat -c '%i' "$LOGFILE" 2>/dev/null || echo "0")
+        new_offset=$(stat -c '%s' "$LOGFILE" 2>/dev/null || echo "0")
+        sqlite3 "$DB" "
+        INSERT OR REPLACE INTO processed_log (id, last_inode, last_offset) VALUES (1, $current_inode, $new_offset);
+        "
+    fi
+    sleep 0.5
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# 启动时回扫
+replay_log
+
+echo "[f2blockd] watching $LOGFILE"
+
+# 记录日志文件初始 inode，用于检测轮转
+LAST_LOG_INODE=$(stat -c '%i' "$LOGFILE" 2>/dev/null || echo "0")
+
+# 使用进程替换替代管道，避免子 shell 问题
+while read -r line; do
+    # 检测日志轮转：inode 变化说明日志被轮转
+    if [ -n "$LAST_LOG_INODE" ]; then
+        CURRENT_INODE=$(stat -c '%i' "$LOGFILE" 2>/dev/null || echo "0")
+        if [ "$CURRENT_INODE" != "$LAST_LOG_INODE" ]; then
+            echo "[f2blockd] 检测到日志轮转（inode: $LAST_LOG_INODE -> $CURRENT_INODE）"
+            LAST_LOG_INODE="$CURRENT_INODE"
+            # 轮转后回扫新日志文件
+            replay_log
+        fi
+    fi
+
+    process_ban_line "$line"
+
+done < <(tail -Fn0 "$LOGFILE")

@@ -1,97 +1,129 @@
 #!/bin/bash
 
-# ==========================================
-# Fail2Ban Block Manager
-# Author: ChatGPT
-# ==========================================
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DB="$SCRIPT_DIR/f2block.db"
+ALLOWLIST="$SCRIPT_DIR/allowlist.txt"
 
-DB_DIR="$HOME/.f2block"
-DB="$DB_DIR/fail2ban_block.db"
-
-mkdir -p "$DB_DIR"
+# SQL 转义单引号，防止注入
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
 
 show_help() {
 cat << EOF
 
-Fail2Ban Block Manager
+Fail2Ban 威胁记录系统
 
-Usage:
-  $(basename "$0")                同步 fail2ban 封禁列表到 iptables 和数据库
+用法：
+  f2block [参数]
 
-Options:
-  -l [N]          查看最近记录（默认50条）
-  -s              查看统计信息
-  -ip <IP>        查询指定IP
-  -c <CC>         查询指定国家代码（如 RO、NL、CN）
-  -h              显示帮助信息
+参数说明：
 
-Examples:
-  $(basename "$0")
-  $(basename "$0") -l
-  $(basename "$0") -l 20
-  $(basename "$0") -s
-  $(basename "$0") -ip 45.148.10.141
-  $(basename "$0") -c RO
+  -l [N]
+      查看最近 IP 记录（默认50条）
+      按最后封禁时间排序（最新在前）
 
-Database:
-  $DB
+  -s
+      统计信息
+      - 总IP数量
+      - 总封禁事件
+      - 国家分布Top10
+
+  -ip <IP>
+      查询指定 IP 的封禁信息
+
+  -c <国家代码>
+      按国家查询（如 CN / US / NL）
+
+  -j <jail>
+      按 jail 查询（如 sshd / nginx）
+
+  -top
+      查看封禁次数最多的IP
+
+  -events [N]
+      查看最近封禁事件记录
+
+  -unban <IP>
+      解封指定 IP（移除 iptables 规则 + 删除数据库记录）
+
+  -allow <IP>
+      添加 IP 到白名单（永不封禁）
+
+  -allowlist
+      查看当前白名单
+
+  -allowdel <IP>
+      从白名单移除 IP
+
+  -export <csv|json>
+      导出 blocked_ips 数据（csv 或 json 格式）
+
+  -h
+      显示帮助信息
+
+示例：
+
+  f2block -l
+  f2block -l 20
+  f2block -s
+  f2block -ip 1.2.3.4
+  f2block -c CN
+  f2block -j sshd
+  f2block -top
+  f2block -events 50
+  f2block -unban 1.2.3.4
+  f2block -allow 10.0.0.1
+  f2block -allowlist
+  f2block -allowdel 10.0.0.1
+  f2block -export csv
+  f2block -export json
+
+数据库位置：
+  与脚本同目录/f2block.db
+白名单位置：
+  与脚本同目录/allowlist.txt
 
 EOF
 }
 
-# 初始化数据库
-sqlite3 "$DB" "
-CREATE TABLE IF NOT EXISTS blocked_ips (
-    ip TEXT PRIMARY KEY,
-    country TEXT,
-    region TEXT,
-    city TEXT,
-    org TEXT,
-    first_seen TEXT,
-    last_seen TEXT
-);
-"
-
-# =========================
-# 参数处理
-# =========================
+[ ! -f "$DB" ] && { echo "数据库不存在: $DB"; exit 1; }
 
 case "$1" in
 
     -h|--help)
         show_help
-        exit 0
         ;;
 
     -l)
         LIMIT=${2:-50}
-
+        [[ ! "$LIMIT" =~ ^[0-9]+$ ]] && { echo "错误: LIMIT 必须为正整数"; exit 1; }
         sqlite3 -header -column "$DB" "
         SELECT
-            last_seen AS LastSeen,
-            ip AS IP,
-            country AS Country,
-            region AS Region,
-            city AS City,
-            org AS Organization
+            ip,
+            country,
+            region,
+            city,
+            ban_count,
+            first_seen,
+            last_ban_time
         FROM blocked_ips
-        ORDER BY last_seen DESC
+        ORDER BY datetime(last_ban_time) DESC
         LIMIT $LIMIT;
         "
-        exit 0
         ;;
 
     -s)
         echo
-        echo "=== Total Blocked IPs ==="
-        sqlite3 "$DB" "
-        SELECT COUNT(*)
-        FROM blocked_ips;
-        "
+        echo "=== 总独立 IP 数 ==="
+        sqlite3 "$DB" "SELECT COUNT(*) FROM blocked_ips;"
 
         echo
-        echo "=== Top 10 Countries ==="
+        echo "=== 总封禁事件数 ==="
+        sqlite3 "$DB" "SELECT COUNT(*) FROM ban_events;"
 
+        echo
+        echo "=== 国家分布 Top10 ==="
         sqlite3 -header -column "$DB" "
         SELECT
             country,
@@ -101,119 +133,197 @@ case "$1" in
         ORDER BY count DESC
         LIMIT 10;
         "
-
-        exit 0
         ;;
 
     -ip)
-
-        if [ -z "$2" ]; then
-            echo "Usage: $0 -ip <IP>"
-            exit 1
-        fi
-
-        sqlite3 -header -column "$DB" "
+        [ -z "$2" ] && { echo "用法: f2block -ip <IP>"; exit 1; }
+        E_IP=$(sql_escape "$2")
+        RESULT=$(sqlite3 -header -column "$DB" "
         SELECT *
         FROM blocked_ips
-        WHERE ip='$2';
-        "
-
-        exit 0
+        WHERE ip='$E_IP';
+        ")
+        if [ -z "$RESULT" ]; then
+            echo "未找到 IP: $2"
+        else
+            echo "$RESULT"
+        fi
         ;;
 
     -c)
+        [ -z "$2" ] && { echo "用法: f2block -c <国家代码>"; exit 1; }
+        E_COUNTRY=$(sql_escape "$2")
+        RESULT=$(sqlite3 -header -column "$DB" "
+        SELECT *
+        FROM blocked_ips
+        WHERE country=UPPER('$E_COUNTRY')
+        ORDER BY datetime(last_ban_time) DESC;
+        ")
+        if [ -z "$RESULT" ]; then
+            echo "未找到国家代码为 $2 的记录"
+        else
+            echo "$RESULT"
+        fi
+        ;;
 
-        if [ -z "$2" ]; then
-            echo "Usage: $0 -c <CountryCode>"
+    -j)
+        [ -z "$2" ] && { echo "用法: f2block -j <jail>"; exit 1; }
+        E_JAIL=$(sql_escape "$2")
+        RESULT=$(sqlite3 -header -column "$DB" "
+        SELECT
+            e.ban_time,
+            e.ip,
+            b.country,
+            b.ban_count
+        FROM ban_events e
+        LEFT JOIN blocked_ips b ON e.ip = b.ip
+        WHERE e.jail='$E_JAIL'
+        ORDER BY e.id DESC
+        LIMIT 100;
+        ")
+        if [ -z "$RESULT" ]; then
+            echo "未找到 jail 为 $2 的记录"
+        else
+            echo "$RESULT"
+        fi
+        ;;
+
+    -top)
+        sqlite3 -header -column "$DB" "
+        SELECT
+            ip,
+            country,
+            ban_count
+        FROM blocked_ips
+        ORDER BY ban_count DESC
+        LIMIT 20;
+        "
+        ;;
+
+    -events)
+        LIMIT=${2:-50}
+        [[ ! "$LIMIT" =~ ^[0-9]+$ ]] && { echo "错误: LIMIT 必须为正整数"; exit 1; }
+        sqlite3 -header -column "$DB" "
+        SELECT
+            ban_time,
+            jail,
+            ip
+        FROM ban_events
+        ORDER BY id DESC
+        LIMIT $LIMIT;
+        "
+        ;;
+
+    -unban)
+        [ -z "$2" ] && { echo "用法: f2block -unban <IP>"; exit 1; }
+        UNBAN_IP="$2"
+        E_IP=$(sql_escape "$UNBAN_IP")
+
+        # 检查数据库中是否存在
+        EXISTS=$(sqlite3 "$DB" "SELECT 1 FROM blocked_ips WHERE ip='$E_IP' LIMIT 1;")
+        if [ "$EXISTS" != "1" ]; then
+            echo "IP $UNBAN_IP 不在封禁记录中"
             exit 1
         fi
 
-        sqlite3 -header -column "$DB" "
-        SELECT *
-        FROM blocked_ips
-        WHERE country=UPPER('$2')
-        ORDER BY last_seen DESC;
-        "
+        # 移除 iptables 规则
+        if iptables -C INPUT -s "$UNBAN_IP" -j DROP 2>/dev/null; then
+            iptables -D INPUT -s "$UNBAN_IP" -j DROP
+            echo "[IPTables] 已移除 $UNBAN_IP 的封禁规则"
+        else
+            echo "[IPTables] $UNBAN_IP 无对应 iptables 规则"
+        fi
 
-        exit 0
+        # 删除数据库记录
+        sqlite3 "$DB" "
+        DELETE FROM blocked_ips WHERE ip='$E_IP';
+        DELETE FROM ban_events WHERE ip='$E_IP';
+        "
+        echo "[DB] 已删除 $UNBAN_IP 的所有记录"
         ;;
 
+    -allow)
+        [ -z "$2" ] && { echo "用法: f2block -allow <IP>"; exit 1; }
+        ALLOW_IP="$2"
+        touch "$ALLOWLIST"
+
+        if grep -qxF "$ALLOW_IP" "$ALLOWLIST" 2>/dev/null; then
+            echo "$ALLOW_IP 已在白名单中"
+            exit 0
+        fi
+
+        echo "$ALLOW_IP" >> "$ALLOWLIST"
+        echo "[白名单] 已添加 $ALLOW_IP"
+
+        # 同时解封该 IP
+        if iptables -C INPUT -s "$ALLOW_IP" -j DROP 2>/dev/null; then
+            iptables -D INPUT -s "$ALLOW_IP" -j DROP
+            echo "[IPTables] 已移除 $ALLOW_IP 的封禁规则"
+        fi
+        ;;
+
+    -allowlist)
+        if [ ! -f "$ALLOWLIST" ] || [ ! -s "$ALLOWLIST" ]; then
+            echo "白名单为空"
+            exit 0
+        fi
+        echo "=== 白名单 ==="
+        cat -n "$ALLOWLIST"
+        ;;
+
+    -allowdel)
+        [ -z "$2" ] && { echo "用法: f2block -allowdel <IP>"; exit 1; }
+        DEL_IP="$2"
+        if [ ! -f "$ALLOWLIST" ]; then
+            echo "白名单文件不存在"
+            exit 1
+        fi
+        if ! grep -qxF "$DEL_IP" "$ALLOWLIST" 2>/dev/null; then
+            echo "$DEL_IP 不在白名单中"
+            exit 1
+        fi
+        sed -i "/^${DEL_IP}$/d" "$ALLOWLIST"
+        echo "[白名单] 已移除 $DEL_IP"
+        ;;
+
+    -export)
+        [ -z "$2" ] && { echo "用法: f2block -export <csv|json>"; exit 1; }
+        FORMAT="$2"
+        case "$FORMAT" in
+            csv)
+                OUTFILE="f2block_export_$(date +%Y%m%d_%H%M%S).csv"
+                sqlite3 -header -csv "$DB" "
+                SELECT ip, country, region, city, org, ban_count, first_seen, last_ban_time
+                FROM blocked_ips
+                ORDER BY datetime(last_ban_time) DESC;
+                " > "$OUTFILE"
+                echo "已导出 CSV: $OUTFILE ($(wc -l < "$OUTFILE") 行)"
+                ;;
+            json)
+                OUTFILE="f2block_export_$(date +%Y%m%d_%H%M%S).json"
+                if command -v jq &>/dev/null; then
+                    sqlite3 -header -json "$DB" "
+                    SELECT ip, country, region, city, org, ban_count, first_seen, last_ban_time
+                    FROM blocked_ips
+                    ORDER BY datetime(last_ban_time) DESC;
+                    " | jq '.' > "$OUTFILE"
+                else
+                    sqlite3 -header -json "$DB" "
+                    SELECT ip, country, region, city, org, ban_count, first_seen, last_ban_time
+                    FROM blocked_ips
+                    ORDER BY datetime(last_ban_time) DESC;
+                    " > "$OUTFILE"
+                fi
+                echo "已导出 JSON: $OUTFILE"
+                ;;
+            *)
+                echo "不支持的格式: $FORMAT（可选: csv, json）"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        show_help
+        ;;
 esac
-
-# =========================
-# 同步 fail2ban
-# =========================
-
-IPS=$(fail2ban-client status sshd 2>/dev/null | \
-      sed -n '/Banned IP list:/s/.*Banned IP list:[[:space:]]*//p')
-
-if [ -z "$IPS" ]; then
-    echo "No banned IPs found in fail2ban."
-    exit 0
-fi
-
-for IP in $IPS; do
-
-    # iptables不存在则添加
-    if ! iptables -C INPUT -s "$IP" -j DROP 2>/dev/null; then
-        iptables -I INPUT -s "$IP" -j DROP
-    fi
-
-    # 数据库已存在则只更新最后发现时间
-    EXISTS=$(sqlite3 "$DB" "
-    SELECT 1
-    FROM blocked_ips
-    WHERE ip='$IP'
-    LIMIT 1;
-    ")
-
-    if [ "$EXISTS" = "1" ]; then
-
-        sqlite3 "$DB" "
-        UPDATE blocked_ips
-        SET last_seen=datetime('now','localtime')
-        WHERE ip='$IP';
-        "
-
-        continue
-    fi
-
-    # 查询IP信息
-    INFO=$(curl -s --max-time 10 "https://ipinfo.io/$IP/json")
-
-    COUNTRY=$(echo "$INFO" | grep '"country"' | awk -F'"' '{print $4}')
-    REGION=$(echo "$INFO" | grep '"region"' | awk -F'"' '{print $4}')
-    CITY=$(echo "$INFO" | grep '"city"' | awk -F'"' '{print $4}')
-    ORG=$(echo "$INFO" | grep '"org"' | awk -F'"' '{print $4}')
-
-    [[ -z "$COUNTRY" ]] && COUNTRY="Unknown"
-    [[ -z "$REGION" ]] && REGION="Unknown"
-    [[ -z "$CITY" ]] && CITY="Unknown"
-    [[ -z "$ORG" ]] && ORG="Unknown"
-
-    sqlite3 "$DB" "
-    INSERT OR IGNORE INTO blocked_ips
-    (
-        ip,
-        country,
-        region,
-        city,
-        org,
-        first_seen,
-        last_seen
-    )
-    VALUES
-    (
-        '$IP',
-        '$COUNTRY',
-        '$REGION',
-        '$CITY',
-        '$ORG',
-        datetime('now','localtime'),
-        datetime('now','localtime')
-    );
-    "
-
-    echo "Blocked $IP ($COUNTRY, $REGION, $CITY, $ORG)"
-
-done

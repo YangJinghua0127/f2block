@@ -1,118 +1,127 @@
-# Fail2Ban Block Manager
+# f2block
 
-一个用于同步 Fail2Ban 封禁 IP 到 `iptables` 并记录到 SQLite 数据库的管理脚本，同时提供查询和统计功能。  
-适合长期记录被封禁 IP 的信息，方便分析扫描攻击来源。
+Fail2Ban 威胁追踪系统 — 实时监控 Fail2Ban 封禁事件，自动查询 IP 地理信息，记录到 SQLite 数据库并执行 iptables 全端口封禁。
 
----
+## 功能
 
-## 功能特点
+- **实时监控** — 守护进程跟踪 `fail2ban.log`，捕获 Ban 事件并自动处理
+- **IP 地理信息** — 通过 ipinfo.io 查询 IP 归属（国家/地区/城市/组织），已有记录自动跳过 API 调用
+- **iptables 封禁** — 自动对被封 IP 执行全端口 DROP 规则
+- **白名单** — 白名单中的 IP 永不封禁，添加时自动解封
+- **启动回扫** — 守护进程启动时自动回扫日志中已有事件，重启不丢数据
+- **日志轮转感知** — 检测 logrotate 导致的日志轮转，自动回扫新文件
+- **数据导出** — 支持 CSV / JSON 格式导出
 
-- 自动同步 Fail2Ban 封禁 IP 到 `iptables`。
-- 将 IP 封禁信息存储到 SQLite 数据库，避免日志文件过大。
-- 支持查询最近封禁记录、统计信息、指定 IP 或国家的封禁记录。
-- 数据库记录首次封禁时间和最近封禁时间。
-- 简单易用的命令行参数操作。
-- 数据库存储在 `~/.f2block/fail2ban_block.db`，无需担心日志混乱。
+## 依赖
 
----
+- `bash`
+- `sqlite3`
+- `iptables`
+- `curl`
+- `fail2ban`（已运行）
+- `jq`（可选，用于更可靠的 JSON 解析）
 
-## 安装依赖
-
-```bash
-sudo apt update
-sudo apt install -y sqlite3 curl iptables
-```
-
-将脚本保存为 `f2block` 并赋予执行权限：
+## 安装
 
 ```bash
-chmod +x f2block
+# 克隆到 /root/.f2block
+git clone https://github.com/YOUR_USERNAME/f2block.git /root/.f2block
+
+# 添加执行权限
+chmod +x /root/.f2block/f2block /root/.f2block/f2blockd
+
+# 创建软链接（可选，方便全局调用）
+ln -s /root/.f2block/f2block /usr/local/bin/f2block
+
+# 安装 systemd 服务
+cp /root/.f2block/f2block.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now f2block.service
 ```
 
----
+## 文件说明
 
-## 使用方法
+| 文件 | 说明 |
+|------|------|
+| `f2blockd` | 守护进程，监控日志并处理封禁事件 |
+| `f2block` | 命令行查询工具 |
+| `f2block.service` | systemd 服务单元文件 |
+| `f2block.db` | SQLite 数据库（自动创建） |
+| `allowlist.txt` | 白名单（自动创建） |
 
-### 同步 Fail2Ban 封禁列表
+## 用法
+
+### 查询
 
 ```bash
-./f2block
+f2block -l              # 查看最近50条封禁记录
+f2block -l 20           # 查看最近20条
+f2block -s              # 统计信息（IP数、事件数、国家Top10）
+f2block -ip 1.2.3.4     # 查询指定IP
+f2block -c CN           # 按国家查询
+f2block -j sshd         # 按 jail 查询
+f2block -top            # 封禁次数最多的IP
+f2block -events 50      # 最近封禁事件
 ```
 
-脚本会自动：
-
-1. 获取 `fail2ban-client status sshd` 当前封禁 IP 列表。
-2. 检查 `iptables` 是否已封禁，未封禁则添加 DROP 规则。
-3. 查询 IP 信息（国家、地区、城市、组织）。
-4. 写入 SQLite 数据库（首次封禁记录 `first_seen`，最后封禁时间 `last_seen`）。
-
----
-
-### 查询功能
-
-| 参数       | 功能                                        |
-| ---------- | ------------------------------------------- |
-| `-l [N]`   | 查看最近 N 条封禁记录（默认 50 条）         |
-| `-s`       | 显示统计信息（总封禁 IP 数量、Top 10 国家） |
-| `-ip <IP>` | 查询指定 IP 的封禁信息                      |
-| `-c <CC>`  | 查询指定国家（Country Code）的封禁记录      |
-| `-h`       | 显示帮助信息                                |
-
-#### 示例
+### 管理
 
 ```bash
-./f2block -l         # 查看最近 50 条记录
-./f2block -l 20      # 查看最近 20 条记录
-./f2block -s         # 查看封禁统计
-./f2block -ip 45.148.10.141  # 查询指定 IP
-./f2block -c CN      # 查询中国封禁记录
-./f2block -h         # 显示帮助
+f2block -unban 1.2.3.4  # 解封IP（移除iptables + 删除数据库记录）
+f2block -allow 10.0.0.1 # 添加到白名单（自动解封）
+f2block -allowlist      # 查看白名单
+f2block -allowdel 10.0.0.1  # 从白名单移除
 ```
 
----
-
-## 数据库说明
-
-数据库文件位置：
-
-```
-~/.f2block/fail2ban_block.db
-```
-
-表结构：
-
-| 列名         | 类型 | 说明            |
-| ------------ | ---- | --------------- |
-| `ip`         | TEXT | IP 地址（主键） |
-| `country`    | TEXT | 国家代码        |
-| `region`     | TEXT | 地区/省份       |
-| `city`       | TEXT | 城市            |
-| `org`        | TEXT | 组织/运营商     |
-| `first_seen` | TEXT | 第一次封禁时间  |
-| `last_seen`  | TEXT | 最近封禁时间    |
-
-> 注意：同一个 IP 仅会插入一次，`last_seen` 会更新最新封禁时间。
-
----
-
-## Cron 定时任务示例
-
-可以将脚本加入 Cron，实现自动同步：
+### 导出
 
 ```bash
-# 每 5 分钟同步一次 fail2ban 封禁 IP
-*/5 * * * * f2block
+f2block -export csv     # 导出为 CSV
+f2block -export json    # 导出为 JSON
 ```
 
----
-
-## 注意事项
-
-- 脚本默认只同步 `sshd` jail，如果你有其他 jail（如 nginx, apache），可以自行修改：
+### 服务管理
 
 ```bash
-IPS=$(fail2ban-client status <jail_name> | sed -n '/Banned IP list:/s/.*Banned IP list:[[:space:]]*//p')
+systemctl status f2block     # 查看状态
+systemctl restart f2block    # 重启
+systemctl stop f2block       # 停止
+journalctl -u f2block -f     # 查看实时日志
 ```
 
-- `iptables` DROP 规则不会重复插入。
-- 数据库不会无限增加重复记录，保证数据整洁。
+## 数据库结构
+
+### blocked_ips
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| ip | TEXT | IP 地址（主键） |
+| country | TEXT | 国家代码 |
+| region | TEXT | 地区 |
+| city | TEXT | 城市 |
+| org | TEXT | 组织/ISP |
+| first_seen | TEXT | 首次发现时间 |
+| last_ban_time | TEXT | 最后封禁时间 |
+| ban_count | INTEGER | 封禁次数 |
+
+### ban_events
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | INTEGER | 自增主键 |
+| ip | TEXT | IP 地址 |
+| jail | TEXT | Fail2Ban jail 名称 |
+| ban_time | TEXT | 封禁时间 |
+
+## 配置
+
+守护进程中的可调参数（`f2blockd` 顶部）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `LOGFILE` | `/var/log/fail2ban.log` | Fail2Ban 日志路径 |
+| `API_DELAY` | `1` | ipinfo.io 请求间隔（秒） |
+
+## License
+
+MIT
