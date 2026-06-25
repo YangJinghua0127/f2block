@@ -137,10 +137,21 @@ process_ban_line() {
         echo "[NEW] $IP"
     fi
 
-    # iptables 全端口封禁
-    if ! iptables -C INPUT -s "$IP" -j DROP 2>/dev/null; then
-        iptables -I INPUT -s "$IP" -j DROP
-        echo "[IPTables] 封禁 $IP"
+    # =========================
+    # 优化封禁逻辑（ipset版）
+    # =========================
+
+    # 初始化 ipset（只执行一次）
+    if ! ipset list f2block &>/dev/null; then
+        ipset create f2block hash:ip timeout 0 -exist
+        iptables -C INPUT -m set --match-set f2block src -j DROP 2>/dev/null || \
+        iptables -I INPUT -m set --match-set f2block src -j DROP
+    fi
+
+    # 加入封禁列表（替代逐条iptables）
+    if ! ipset test f2block "$IP" &>/dev/null; then
+        ipset add f2block "$IP" -exist
+        echo "[IPSET] 封禁 $IP"
     fi
 }
 
